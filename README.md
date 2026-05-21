@@ -1,13 +1,23 @@
-# Syntalos Python Module Template
+# Syntalos UVC Camera Module
 
-Template for a Syntalos Python module.
+Python Syntalos module for streaming frames from UVC/V4L2 cameras with
+`pyrav4l2`.
 
-The default module:
+The module opens a selected `/dev/video*` device, configures a supported pixel
+format, frame size, and frame interval, decodes frames to OpenCV-compatible NumPy
+arrays, and emits them on a `Frame` output port.
 
-- forwards a `Frame` input to a `Frame` output through an `on_data` callback
-- emits a dummy `SignalBlockF32` output from the tick callback
-- persists a `Settings` dataclass through Syntalos save/load callbacks
-- uses a per-module virtual environment with `requirements.txt`
+The settings dialog is generated in Python with PyQt6. It enumerates the selected
+camera's supported formats, sizes, frame rates, and V4L2 controls. Camera controls
+can remain open during a stream; live changes are sent to the capture thread via a
+small queue and are intended for tuning camera settings before real acquisition.
 
-When creating a new module, update `module.toml`, replace the dummy names, and
-adjust the ports, metadata, settings, and processing logic in `module.py`.
+Currently decoded formats:
+
+- MJPEG/JPEG
+- YUYV
+- UYVY
+- RGB24
+- BGR24
+- GREY
+- Y16
