@@ -1,0 +1,19 @@
+[syntalos_module]
+type = "python"
+
+name = "Dummy Python Module"
+description = "Template Python module that forwards frames and emits a dummy float signal."
+# icon = "module-icon.svg"
+
+main = "module.py"
+# Run this module in a dedicated venv with requirements.txt installed.
+use_venv = true
+
+# Set to true for work-in-progress/development modules.
+# Development modules are hidden unless Syntalos developer mode is enabled.
+devel = false
+
+# Common module categories include 'device' for hardware/device support and
+# 'processing' for data transformation modules.
+categories = ['processing']
+features = []

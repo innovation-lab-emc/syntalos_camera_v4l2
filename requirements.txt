@@ -1,0 +1,2 @@
+numpy
+setproctitle # required for rename_process=True
