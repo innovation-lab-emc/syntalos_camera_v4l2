@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -571,6 +572,32 @@ def item_label(item: Item) -> str:
     if isinstance(item, IntegerMenuItem):
         return str(item.value)
     return str(item.index)
+
+
+def control_step(control: Control) -> int:
+    return max(int(control.step), 1)
+
+
+def control_step_count(control: Control) -> int:
+    minimum = int(control.minimum)
+    maximum = int(control.maximum)
+    return max((maximum - minimum) // control_step(control), 0)
+
+
+def control_value_from_step_index(control: Control, index: int) -> int:
+    minimum = int(control.minimum)
+    return minimum + max(index, 0) * control_step(control)
+
+
+def control_step_index_for_value(control: Control, value: int) -> int:
+    minimum = int(control.minimum)
+    maximum_steps = control_step_count(control)
+    raw_index = round((max(int(value), minimum) - minimum) / control_step(control))
+    return max(0, min(maximum_steps, raw_index))
+
+
+def snap_control_value(control: Control, value: int) -> int:
+    return control_value_from_step_index(control, control_step_index_for_value(control, value))
 
 
 @final
@@ -1208,14 +1235,7 @@ class Module:
                 )
                 return line_edit
 
-            spinbox = QSpinBox()
-            spinbox.setRange(int(control.minimum), int(control.maximum))
-            spinbox.setSingleStep(max(int(control.step), 1))
-            spinbox.setValue(max(int(control.minimum), min(int(control.maximum), int(value))))
-            spinbox.valueChanged.connect(
-                lambda value, ctrl_id=control.id: self.on_control_changed(ctrl_id, int(value))
-            )
-            return spinbox
+            return self.integer_control_widget(control, int(value))
 
         if control.type == V4L2_CTRL_TYPE_STRING:
             line_edit = QLineEdit(str(value))
@@ -1227,6 +1247,73 @@ class Module:
             return line_edit
 
         return None
+
+    def integer_control_widget(self, control: Control, value: int) -> QWidget:
+        step_count = control_step_count(control)
+        step = control_step(control)
+        effective_maximum = control_value_from_step_index(control, step_count)
+        initial_value = snap_control_value(control, value)
+
+        if step_count > SPINBOX_MAX:
+            spinbox = QSpinBox()
+            spinbox.setRange(int(control.minimum), int(control.maximum))
+            spinbox.setSingleStep(step)
+            spinbox.setValue(initial_value)
+            spinbox.valueChanged.connect(
+                lambda new_value, ctrl_id=control.id: self.on_control_changed(
+                    ctrl_id,
+                    snap_control_value(control, int(new_value)),
+                )
+            )
+            return spinbox
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, step_count)
+        slider.setSingleStep(1)
+        slider.setPageStep(max(1, step_count // 10))
+        slider.setValue(control_step_index_for_value(control, initial_value))
+
+        spinbox = QSpinBox()
+        spinbox.setRange(int(control.minimum), effective_maximum)
+        spinbox.setSingleStep(step)
+        spinbox.setValue(initial_value)
+        spinbox.setMinimumWidth(96)
+
+        layout.addWidget(slider, 1)
+        layout.addWidget(spinbox)
+
+        syncing = False
+
+        def set_widgets(new_value: int) -> None:
+            nonlocal syncing
+            syncing = True
+            slider.setValue(control_step_index_for_value(control, new_value))
+            spinbox.setValue(new_value)
+            syncing = False
+
+        def submit_value(new_value: int) -> None:
+            value_to_submit = snap_control_value(control, new_value)
+            set_widgets(value_to_submit)
+            self.on_control_changed(control.id, value_to_submit)
+
+        def slider_changed(step_index: int) -> None:
+            if syncing:
+                return
+            submit_value(control_value_from_step_index(control, step_index))
+
+        def spinbox_changed(new_value: int) -> None:
+            if syncing:
+                return
+            submit_value(new_value)
+
+        slider.valueChanged.connect(slider_changed)
+        spinbox.valueChanged.connect(spinbox_changed)
+        return container
 
     def on_control_changed(
         self, control_id: int, value: JsonControlValue, persist: bool = True
