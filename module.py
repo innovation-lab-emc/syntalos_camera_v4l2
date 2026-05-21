@@ -57,6 +57,7 @@ import syntalos_mlink as syl
 
 
 FRAME_QUEUE_MAX = 16
+DECODE_WARNING_INTERVAL = 30
 SPINBOX_MIN = -(2**31)
 SPINBOX_MAX = 2**31 - 1
 
@@ -121,6 +122,10 @@ class CapturedFrame:
 @dataclass(frozen=True)
 class CaptureError:
     message: str
+
+
+class FrameDecodeError(ValueError):
+    pass
 
 
 def serialise_settings(settings: Settings) -> bytes:
@@ -425,12 +430,24 @@ def queue_put_drop_oldest(
         frame_queue.put_nowait(item)
 
 
+def trim_jpeg_payload(frame_bytes: bytes) -> bytes:
+    start = frame_bytes.find(b"\xff\xd8")
+    if start < 0:
+        return frame_bytes
+
+    end = frame_bytes.rfind(b"\xff\xd9")
+    if end >= start:
+        return frame_bytes[start : end + 2]
+
+    return frame_bytes[start:]
+
+
 def decode_frame(frame_bytes: bytes, pixel_format: int, width: int, height: int) -> np.ndarray:
     if pixel_format in (V4L2_PIX_FMT_MJPEG, V4L2_PIX_FMT_JPEG):
-        raw = np.frombuffer(frame_bytes, dtype=np.uint8)
+        raw = np.frombuffer(trim_jpeg_payload(bytes(frame_bytes)), dtype=np.uint8)
         mat = cv.imdecode(raw, cv.IMREAD_COLOR)
         if mat is None:
-            raise ValueError("OpenCV failed to decode JPEG frame")
+            raise FrameDecodeError("OpenCV failed to decode JPEG frame")
         return mat
 
     if pixel_format == V4L2_PIX_FMT_YUYV:
@@ -483,6 +500,7 @@ def capture_loop(
         apply_saved_controls(device, config.control_values)
 
         frame_index = 0
+        decode_failures = 0
         for frame_bytes in Stream(device):
             drain_control_queue(device, control_queue)
             if stop_event.is_set():
@@ -491,12 +509,20 @@ def capture_loop(
             frame_time_us = config.start_syl_us + max(
                 0, (time.perf_counter_ns() - config.start_perf_ns) // 1_000
             )
-            mat = decode_frame(
-                frame_bytes,
-                config.pixel_format,
-                config.frame_width,
-                config.frame_height,
-            )
+            try:
+                mat = decode_frame(
+                    frame_bytes,
+                    config.pixel_format,
+                    config.frame_width,
+                    config.frame_height,
+                )
+            except FrameDecodeError as exc:
+                decode_failures += 1
+                if decode_failures == 1 or decode_failures % DECODE_WARNING_INTERVAL == 0:
+                    print(f"Skipping undecodable frame {frame_index}: {exc}")
+                frame_index += 1
+                continue
+
             queue_put_drop_oldest(frame_queue, CapturedFrame(frame_index, frame_time_us, mat))
             frame_index += 1
 
