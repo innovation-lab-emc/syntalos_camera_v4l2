@@ -370,6 +370,28 @@ def control_value_to_json(control: Control, value: Any) -> JsonControlValue:
     return int(value)
 
 
+def should_persist_control(control: Control) -> bool:
+    return not control.is_disabled and control.type != V4L2_CTRL_TYPE_BUTTON
+
+
+def read_camera_control_values(device: Device) -> dict[str, JsonControlValue]:
+    values: dict[str, JsonControlValue] = {}
+    for control in device.controls:
+        if not should_persist_control(control):
+            continue
+        try:
+            values[str(control.id)] = control_value_to_json(
+                control,
+                device.get_control_value(control),
+            )
+        except Exception as exc:
+            print(
+                f"Unable to read control {control.name} "
+                + f"(0x{control.id:08x}): {exc.__class__.__name__}({exc})"
+            )
+    return values
+
+
 def value_for_control_set(control: Control, value: JsonControlValue) -> bool | int | str | Item:
     if isinstance(control, Menu):
         item = menu_item_by_index(control, int(value))
@@ -625,9 +647,7 @@ class Module:
     # # ################################################################################
 
     def register_ports(self) -> None:
-        self.out_frames = self.mlink.register_output_port(
-            "frames", "Frames", syl.DataType.Frame
-        )
+        self.out_frames = self.mlink.register_output_port("frames", "Frames", syl.DataType.Frame)
 
     def register_callbacks(self) -> None:
         self.mlink.on_prepare = self.prepare
@@ -712,7 +732,35 @@ class Module:
             raise
 
     def save_settings(self, _base_dir: Path) -> bytes:
+        self.update_settings_from_camera()
         return serialise_settings(self.settings)
+
+    def update_settings_from_camera(self) -> None:
+        device_path = self.settings.device_path.strip()
+        if not device_path and self.capture_config is not None:
+            device_path = self.capture_config.device_path
+        if not device_path:
+            return
+
+        try:
+            device = Device(device_path)
+            color_format, frame_size = device.get_format()
+            interval = device.get_frame_interval()
+            control_values = read_camera_control_values(device)
+        except Exception as exc:
+            print(
+                f"Unable to read camera settings from {device_path}: "
+                + f"{exc.__class__.__name__}({exc})"
+            )
+            return
+
+        self.settings.device_path = device_path
+        self.settings.pixel_format = int(color_format.pixelformat)
+        self.settings.frame_width = int(frame_size.width)
+        self.settings.frame_height = int(frame_size.height)
+        self.settings.interval_numerator = int(interval.numerator)
+        self.settings.interval_denominator = int(interval.denominator)
+        self.settings.control_values.update(control_values)
 
     # # ################################################################################
     # # Capture handling
