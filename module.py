@@ -60,8 +60,45 @@ import syntalos_mlink as syl
 
 FRAME_QUEUE_MAX = 16
 DECODE_WARNING_INTERVAL = 30
+DROP_WARNING_INTERVAL = 30
 SPINBOX_MIN = -(2**31)
 SPINBOX_MAX = 2**31 - 1
+
+V4L2_CID_BASE = 0x00980900
+V4L2_CID_AUTO_WHITE_BALANCE = V4L2_CID_BASE + 12
+V4L2_CID_WHITE_BALANCE_TEMPERATURE = V4L2_CID_BASE + 26
+
+V4L2_CID_CAMERA_CLASS_BASE = 0x009A0900
+V4L2_CID_EXPOSURE_AUTO = V4L2_CID_CAMERA_CLASS_BASE + 1
+V4L2_CID_EXPOSURE_ABSOLUTE = V4L2_CID_CAMERA_CLASS_BASE + 2
+V4L2_CID_EXPOSURE_AUTO_PRIORITY = V4L2_CID_CAMERA_CLASS_BASE + 3
+V4L2_CID_FOCUS_ABSOLUTE = V4L2_CID_CAMERA_CLASS_BASE + 10
+V4L2_CID_FOCUS_AUTO = V4L2_CID_CAMERA_CLASS_BASE + 12
+
+AUTO_CONTROL_IDS = {
+    V4L2_CID_AUTO_WHITE_BALANCE,
+    V4L2_CID_EXPOSURE_AUTO,
+    V4L2_CID_FOCUS_AUTO,
+}
+
+DEPENDENT_CONTROL_IDS = {
+    V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+    V4L2_CID_EXPOSURE_ABSOLUTE,
+    V4L2_CID_FOCUS_ABSOLUTE,
+}
+
+CONTROL_NAME_PRIORITIES = {
+    "auto_white_balance": 0,
+    "white_balance_temperature_auto": 0,
+    "exposure_auto": 0,
+    "auto_exposure": 0,
+    "focus_auto": 0,
+    "autofocus": 0,
+    "exposure_auto_priority": 1,
+    "white_balance_temperature": 20,
+    "exposure_absolute": 20,
+    "focus_absolute": 20,
+}
 
 JsonControlValue = bool | int | str
 
@@ -120,6 +157,22 @@ class CaptureConfig:
 class ControlUpdate:
     control_id: int
     value: JsonControlValue
+
+
+class ControlUpdateBuffer:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._updates: dict[int, ControlUpdate] = {}
+
+    def put(self, update: ControlUpdate) -> None:
+        with self._lock:
+            self._updates[update.control_id] = update
+
+    def drain(self) -> list[ControlUpdate]:
+        with self._lock:
+            updates = list(self._updates.values())
+            self._updates.clear()
+        return updates
 
 
 @dataclass(frozen=True)
@@ -395,12 +448,56 @@ def control_value_to_json(control: Control, value: Any) -> JsonControlValue:
     raise ValueError(f"Unsupported control type {control.type} for {control.name}")
 
 
-def should_persist_control(control: Control) -> bool:
+def normalized_control_name(control: Control) -> str:
+    return control.name.lower().replace(" ", "_").replace("-", "_").replace(",", "")
+
+
+def control_apply_priority(control: Control) -> tuple[int, int]:
+    if control.id in AUTO_CONTROL_IDS:
+        return 0, control.id
+    if control.id == V4L2_CID_EXPOSURE_AUTO_PRIORITY:
+        return 1, control.id
+    if control.id in DEPENDENT_CONTROL_IDS:
+        return 20, control.id
+    return CONTROL_NAME_PRIORITIES.get(normalized_control_name(control), 10), control.id
+
+
+def should_consider_control(control: Control) -> bool:
     if control.is_disabled:
+        return False
+    if control.is_read_only or control.is_volatile:
         return False
     if control.type in (V4L2_CTRL_TYPE_BUTTON, V4L2_CTRL_TYPE_CTRL_CLASS):
         return False
     return isinstance(control, Menu) or control.type in VALUE_CONTROL_TYPES
+
+
+def should_persist_control(control: Control) -> bool:
+    if not should_consider_control(control):
+        return False
+    if control.is_inactive:
+        return False
+    return True
+
+
+def should_apply_saved_control(control: Control) -> bool:
+    if not should_consider_control(control):
+        return False
+    if control.is_inactive and control.id not in DEPENDENT_CONTROL_IDS:
+        return False
+    return True
+
+
+def should_apply_live_control(control: Control) -> bool:
+    if control.is_disabled or control.is_read_only or control.is_inactive:
+        return False
+    if control.type == V4L2_CTRL_TYPE_CTRL_CLASS:
+        return False
+    return (
+        isinstance(control, Menu)
+        or control.type in VALUE_CONTROL_TYPES
+        or control.type == V4L2_CTRL_TYPE_BUTTON
+    )
 
 
 def read_camera_control_values(device: Device) -> dict[str, JsonControlValue]:
@@ -440,30 +537,41 @@ def apply_control_update(device: Device, update: ControlUpdate) -> None:
     control = find_control(device, update.control_id)
     if control is None:
         return
+    if not should_apply_live_control(control):
+        return
     device.set_control_value(control, value_for_control_set(control, update.value))
 
 
 def apply_saved_controls(device: Device, control_values: dict[str, JsonControlValue]) -> None:
+    pending: list[tuple[tuple[int, int], ControlUpdate]] = []
     for key, value in control_values.items():
         try:
             control_id = int(key)
         except ValueError:
             continue
         control = find_control(device, control_id)
-        if control is None or not should_persist_control(control):
+        if control is None or not should_consider_control(control):
+            continue
+        pending.append((control_apply_priority(control), ControlUpdate(control_id, value)))
+
+    for _priority, update in sorted(pending, key=lambda item: item[0]):
+        control = find_control(device, update.control_id)
+        if control is None or not should_apply_saved_control(control):
             continue
         try:
-            apply_control_update(device, ControlUpdate(control_id, value))
+            device.set_control_value(control, value_for_control_set(control, update.value))
         except Exception as exc:
-            print(f"Unable to set control {control_id}: {exc.__class__.__name__}({exc})")
+            print(f"Unable to set control {update.control_id}: {exc.__class__.__name__}({exc})")
 
 
-def drain_control_queue(device: Device, control_queue: queue.Queue[ControlUpdate]) -> None:
-    while True:
-        try:
-            update = control_queue.get_nowait()
-        except queue.Empty:
-            break
+def drain_control_queue(device: Device, control_queue: ControlUpdateBuffer) -> None:
+    updates = control_queue.drain()
+    updates.sort(
+        key=lambda update: control_apply_priority(control)
+        if (control := find_control(device, update.control_id)) is not None
+        else (10, update.control_id)
+    )
+    for update in updates:
         try:
             apply_control_update(device, update)
         except Exception as exc:
@@ -472,17 +580,35 @@ def drain_control_queue(device: Device, control_queue: queue.Queue[ControlUpdate
 
 def queue_put_drop_oldest(
     frame_queue: queue.Queue[CapturedFrame | CaptureError], item: CapturedFrame | CaptureError
-) -> None:
+) -> bool:
     try:
         frame_queue.put_nowait(item)
-        return
+        return False
     except queue.Full:
         pass
 
-    with contextlib.suppress(queue.Empty):
-        _ = frame_queue.get_nowait()
-    with contextlib.suppress(queue.Full):
+    if isinstance(item, CaptureError):
+        with contextlib.suppress(queue.Empty):
+            _ = frame_queue.get_nowait()
+        with contextlib.suppress(queue.Full):
+            frame_queue.put_nowait(item)
+        return True
+
+    try:
+        dropped_item = frame_queue.get_nowait()
+    except queue.Empty:
+        dropped_item = None
+
+    if isinstance(dropped_item, CaptureError):
+        with contextlib.suppress(queue.Full):
+            frame_queue.put_nowait(dropped_item)
+        return True
+
+    try:
         frame_queue.put_nowait(item)
+    except queue.Full:
+        return True
+    return isinstance(dropped_item, CapturedFrame)
 
 
 def trim_jpeg_payload(frame_bytes: bytes) -> bytes:
@@ -538,7 +664,7 @@ def decode_frame(frame_bytes: bytes, pixel_format: int, width: int, height: int)
 def capture_loop(
     config: CaptureConfig,
     frame_queue: queue.Queue[CapturedFrame | CaptureError],
-    control_queue: queue.Queue[ControlUpdate],
+    control_queue: ControlUpdateBuffer,
     stop_event: threading.Event,
 ) -> None:
     try:
@@ -556,6 +682,7 @@ def capture_loop(
 
         frame_index = 0
         decode_failures = 0
+        queue_drop_count = 0
         for frame_bytes in Stream(device):
             drain_control_queue(device, control_queue)
             if stop_event.is_set():
@@ -578,7 +705,13 @@ def capture_loop(
                 frame_index += 1
                 continue
 
-            queue_put_drop_oldest(frame_queue, CapturedFrame(frame_index, frame_time_us, mat))
+            if queue_put_drop_oldest(frame_queue, CapturedFrame(frame_index, frame_time_us, mat)):
+                queue_drop_count += 1
+                if queue_drop_count == 1 or queue_drop_count % DROP_WARNING_INTERVAL == 0:
+                    print(
+                        "Capture queue full; "
+                        f"dropped {queue_drop_count} frame(s) before submission"
+                    )
             frame_index += 1
 
             if stop_event.is_set():
@@ -587,7 +720,7 @@ def capture_loop(
         if stop_event.is_set():
             return
         detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-        queue_put_drop_oldest(frame_queue, CaptureError(detail))
+        _ = queue_put_drop_oldest(frame_queue, CaptureError(detail))
 
 
 def clear_layout(layout: QFormLayout) -> None:
@@ -666,7 +799,10 @@ class Module:
         self.capture_thread: threading.Thread | None = None
         self.capture_stop_event: threading.Event | None = None
         self.frame_queue: queue.Queue[CapturedFrame | CaptureError] | None = None
-        self.control_queue: queue.Queue[ControlUpdate] | None = None
+        self.control_queue: ControlUpdateBuffer | None = None
+        self.next_expected_frame_index = 0
+        self.dropped_frame_count = 0
+        self.frame_gap_warning_count = 0
 
         self.settings_dialog: QDialog | None = None
         self.populating_controls = False
@@ -711,7 +847,7 @@ class Module:
             self.out_frames.set_metadata_value("framerate", fps)
 
         self.frame_queue = queue.Queue(maxsize=FRAME_QUEUE_MAX)
-        self.control_queue = queue.Queue()
+        self.control_queue = ControlUpdateBuffer()
         self.capture_stop_event = threading.Event()
         self.update_capture_widget_state()
         return True
@@ -731,6 +867,9 @@ class Module:
         )
         self.capture_config = config
         self.running = True
+        self.next_expected_frame_index = 0
+        self.dropped_frame_count = 0
+        self.frame_gap_warning_count = 0
         self.update_capture_widget_state()
 
         self.capture_thread = threading.Thread(
@@ -792,7 +931,7 @@ class Module:
         self.settings.frame_height = int(frame_size.height)
         self.settings.interval_numerator = int(interval.numerator)
         self.settings.interval_denominator = int(interval.denominator)
-        self.settings.control_values.update(control_values)
+        self.settings.control_values = control_values
 
     # # ################################################################################
     # # Capture handling
@@ -811,6 +950,32 @@ class Module:
 
         self.capture_thread = None
         self.capture_stop_event = None
+
+    def note_submitted_frame_index(self, frame_index: int) -> bool:
+        expected_index = self.next_expected_frame_index
+        if frame_index > expected_index:
+            missed = frame_index - expected_index
+            self.dropped_frame_count += missed
+            self.frame_gap_warning_count += 1
+            if (
+                self.frame_gap_warning_count == 1
+                or self.frame_gap_warning_count % DROP_WARNING_INTERVAL == 0
+            ):
+                print(
+                    "Camera frame index gap detected: "
+                    f"missed {missed} frame(s); "
+                    f"{self.dropped_frame_count} total frame(s) missed"
+                )
+            self.set_status(f"Recording; {self.dropped_frame_count} frame(s) missed.")
+        elif frame_index < expected_index:
+            print(
+                f"Ignoring out-of-order camera frame index {frame_index}, "
+                f"expected {expected_index}"
+            )
+            return False
+
+        self.next_expected_frame_index = frame_index + 1
+        return True
 
     def process_capture_queue(self) -> None:
         frame_queue = self.frame_queue
@@ -831,6 +996,8 @@ class Module:
             if not self.running:
                 continue
 
+            if not self.note_submitted_frame_index(item.index):
+                continue
             frame = syl.Frame()
             frame.mat = item.mat
             frame.time_usec = item.time_usec
