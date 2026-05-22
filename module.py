@@ -42,6 +42,7 @@ from pyrav4l2.v4l2 import (
     V4L2_CTRL_TYPE_BITMASK,
     V4L2_CTRL_TYPE_BOOLEAN,
     V4L2_CTRL_TYPE_BUTTON,
+    V4L2_CTRL_TYPE_CTRL_CLASS,
     V4L2_CTRL_TYPE_INTEGER,
     V4L2_CTRL_TYPE_INTEGER64,
     V4L2_CTRL_TYPE_STRING,
@@ -73,6 +74,14 @@ SUPPORTED_PIXEL_FORMATS = {
     V4L2_PIX_FMT_BGR24,
     V4L2_PIX_FMT_GREY,
     V4L2_PIX_FMT_Y16,
+}
+
+VALUE_CONTROL_TYPES = {
+    V4L2_CTRL_TYPE_BITMASK,
+    V4L2_CTRL_TYPE_BOOLEAN,
+    V4L2_CTRL_TYPE_INTEGER,
+    V4L2_CTRL_TYPE_INTEGER64,
+    V4L2_CTRL_TYPE_STRING,
 }
 
 
@@ -367,11 +376,15 @@ def control_value_to_json(control: Control, value: Any) -> JsonControlValue:
         return int(value)
     if control.type == V4L2_CTRL_TYPE_STRING:
         return str(value)
-    return int(value)
+    raise ValueError(f"Unsupported control type {control.type} for {control.name}")
 
 
 def should_persist_control(control: Control) -> bool:
-    return not control.is_disabled and control.type != V4L2_CTRL_TYPE_BUTTON
+    if control.is_disabled:
+        return False
+    if control.type in (V4L2_CTRL_TYPE_BUTTON, V4L2_CTRL_TYPE_CTRL_CLASS):
+        return False
+    return isinstance(control, Menu) or control.type in VALUE_CONTROL_TYPES
 
 
 def read_camera_control_values(device: Device) -> dict[str, JsonControlValue]:
@@ -419,6 +432,9 @@ def apply_saved_controls(device: Device, control_values: dict[str, JsonControlVa
         try:
             control_id = int(key)
         except ValueError:
+            continue
+        control = find_control(device, control_id)
+        if control is None or not should_persist_control(control):
             continue
         try:
             apply_control_update(device, ControlUpdate(control_id, value))
