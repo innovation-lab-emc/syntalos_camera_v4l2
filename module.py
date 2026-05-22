@@ -347,11 +347,14 @@ def build_capture_config(settings: Settings) -> CaptureConfig:
     color_format = choose_color_format(device, settings)
     frame_size = choose_frame_size(device, color_format, settings)
     device.set_format(color_format, frame_size)
+    color_format, frame_size = device.get_format()
 
     interval = choose_frame_interval(device, color_format, frame_size, settings)
     if interval.numerator > 0 and interval.denominator > 0:
         with contextlib.suppress(Exception):
             device.set_frame_interval(interval)
+    with contextlib.suppress(Exception):
+        interval = device.get_frame_interval()
 
     return CaptureConfig(
         device_path=device_path,
@@ -1085,8 +1088,10 @@ class Module:
             return
         self.settings.pixel_format = int(pixel_format)
 
-        with contextlib.suppress(Exception):
+        try:
             self.populate_size_combo(Device(self.selected_device_path()))
+        except Exception as exc:
+            self.set_status(f"Unable to set pixel format: {exc}")
 
     def populate_size_combo(self, device: Device) -> None:
         dialog = self.settings_dialog
@@ -1146,8 +1151,10 @@ class Module:
         self.settings.frame_width = int(width)
         self.settings.frame_height = int(height)
 
-        with contextlib.suppress(Exception):
+        try:
             self.populate_interval_combo(Device(self.selected_device_path()))
+        except Exception as exc:
+            self.set_status(f"Unable to set frame size: {exc}")
 
     def selected_frame_size(self) -> FrameSize | None:
         dialog = self.settings_dialog
@@ -1159,6 +1166,51 @@ class Module:
         width, height = size_data
         return FrameSize(int(width), int(height))
 
+    def selected_frame_interval(self) -> FrameInterval | None:
+        dialog = self.settings_dialog
+        if dialog is None:
+            return None
+        data = dialog.intervalComboBox.currentData()
+        if data is None:
+            return None
+        numerator, denominator = data
+        return FrameInterval(int(numerator), int(denominator))
+
+    def set_combo_current_data(self, combo: QComboBox, data: Any) -> bool:
+        for idx in range(combo.count()):
+            if combo.itemData(idx) == data:
+                previous_blocked = combo.blockSignals(True)
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(previous_blocked)
+                return True
+        return False
+
+    def sync_capture_settings_from_device(
+        self,
+        color_format: ColorFormat,
+        frame_size: FrameSize,
+        interval: FrameInterval,
+    ) -> None:
+        self.settings.pixel_format = int(color_format.pixelformat)
+        self.settings.frame_width = int(frame_size.width)
+        self.settings.frame_height = int(frame_size.height)
+        self.settings.interval_numerator = int(interval.numerator)
+        self.settings.interval_denominator = int(interval.denominator)
+
+        dialog = self.settings_dialog
+        if dialog is None:
+            return
+
+        self.set_combo_current_data(dialog.formatComboBox, self.settings.pixel_format)
+        self.set_combo_current_data(
+            dialog.sizeComboBox,
+            (self.settings.frame_width, self.settings.frame_height),
+        )
+        self.set_combo_current_data(
+            dialog.intervalComboBox,
+            (self.settings.interval_numerator, self.settings.interval_denominator),
+        )
+
     def apply_selected_capture_settings(self, device: Device) -> None:
         color_format = self.selected_color_format(device)
         frame_size = self.selected_frame_size()
@@ -1166,13 +1218,20 @@ class Module:
             return
 
         device.set_format(color_format, frame_size)
-        if self.settings.interval_numerator > 0 and self.settings.interval_denominator > 0:
-            device.set_frame_interval(
-                FrameInterval(
-                    self.settings.interval_numerator,
-                    self.settings.interval_denominator,
-                )
-            )
+        interval_error: Exception | None = None
+        interval = self.selected_frame_interval()
+        if interval is not None and interval.numerator > 0 and interval.denominator > 0:
+            try:
+                device.set_frame_interval(interval)
+            except Exception as exc:
+                interval_error = exc
+
+        actual_format, actual_size = device.get_format()
+        actual_interval = device.get_frame_interval()
+        self.sync_capture_settings_from_device(actual_format, actual_size, actual_interval)
+
+        if interval_error is not None:
+            raise interval_error
 
     def populate_interval_combo(self, device: Device) -> None:
         dialog = self.settings_dialog
@@ -1224,8 +1283,10 @@ class Module:
             numerator, denominator = dialog.intervalComboBox.currentData()
             self.settings.interval_numerator = int(numerator)
             self.settings.interval_denominator = int(denominator)
-            with contextlib.suppress(Exception):
-                self.apply_selected_capture_settings(device)
+        try:
+            self.apply_selected_capture_settings(device)
+        except Exception as exc:
+            self.set_status(f"Unable to set capture format: {exc}")
 
     def on_interval_changed(self, _index: int | None = None) -> None:
         if self.running or self.mlink.is_running:
