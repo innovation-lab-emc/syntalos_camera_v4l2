@@ -3,7 +3,7 @@ type = "python"
 
 name = "UVC Camera"
 description = "Streams frames from UVC/V4L2 cameras via pyrav4l2."
-# icon = "module-icon.svg"
+icon = "webcam.svg"
 
 main = "module.py"
 # Run this module in a dedicated venv with requirements.txt installed.

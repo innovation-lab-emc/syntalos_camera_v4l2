@@ -1,0 +1,9 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Webcamera">
+  <rect x="14" y="20" width="36" height="24" rx="5" fill="#2f3437"/>
+  <rect x="18" y="24" width="28" height="16" rx="3" fill="#454c50"/>
+  <circle cx="32" cy="32" r="8" fill="#121416"/>
+  <circle cx="32" cy="32" r="5" fill="#4f9fd8"/>
+  <circle cx="29" cy="29" r="2" fill="#d9f0ff"/>
+  <path d="M26 44h12l3 8H23z" fill="#2f3437"/>
+  <rect x="20" y="52" width="24" height="4" rx="2" fill="#2f3437"/>
+</svg>
