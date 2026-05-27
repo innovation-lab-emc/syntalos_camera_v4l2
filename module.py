@@ -916,6 +916,7 @@ class Module:
 
         self.settings_dialog: QDialog | None = None
         self.populating_controls = False
+        self.capture_widgets_enabled: bool | None = None
 
         self.register_ports()
         self.register_callbacks()
@@ -996,6 +997,7 @@ class Module:
     def event_loop_tick(self) -> None:
         self.app.processEvents()
         self.process_capture_queue()
+        self.update_capture_widget_state_if_needed()
 
         if self.running and self.capture_thread is not None and not self.capture_thread.is_alive():
             self.running = False
@@ -1225,6 +1227,7 @@ class Module:
             return
 
         capture_enabled = not self.running and not self.mlink.is_running
+        self.capture_widgets_enabled = capture_enabled
         for attr in (
             "deviceComboBox",
             "refreshDevicesButton",
@@ -1235,6 +1238,20 @@ class Module:
             widget = getattr(dialog, attr, None)
             if widget is not None:
                 widget.setEnabled(capture_enabled)
+
+    def update_capture_widget_state_if_needed(self) -> None:
+        dialog = self.settings_dialog
+        if dialog is None:
+            return
+
+        capture_enabled = not self.running and not self.mlink.is_running
+        previous_enabled = self.capture_widgets_enabled
+        if capture_enabled == previous_enabled:
+            return
+
+        self.update_capture_widget_state(dialog)
+        if capture_enabled and previous_enabled is False:
+            self.on_device_changed()
 
     def set_status(self, text: str) -> None:
         dialog = self.settings_dialog
@@ -1312,6 +1329,7 @@ class Module:
             return
 
         if self.running or self.mlink.is_running:
+            self.populate_active_capture_combos(device)
             self.populate_controls(device)
             self.set_status(f"{device.device_name} via {device.driver_name}")
             return
@@ -1347,6 +1365,72 @@ class Module:
 
         self.settings.pixel_format = int(dialog.formatComboBox.currentData())
         self.populate_size_combo(device)
+
+    def active_capture_config_for_device(self, device_path: str) -> CaptureConfig | None:
+        config = self.capture_config
+        if config is not None and config.device_path == device_path:
+            return config
+        if self.settings.device_path == device_path and self.settings.pixel_format:
+            return CaptureConfig(
+                device_path=self.settings.device_path,
+                pixel_format=self.settings.pixel_format,
+                frame_width=self.settings.frame_width,
+                frame_height=self.settings.frame_height,
+                interval_numerator=self.settings.interval_numerator,
+                interval_denominator=self.settings.interval_denominator,
+                control_values=dict(self.settings.control_values),
+            )
+        return None
+
+    def populate_active_capture_combos(self, device: Device) -> None:
+        dialog = self.settings_dialog
+        if dialog is None:
+            return
+
+        config = self.active_capture_config_for_device(str(device.path))
+        if config is None:
+            self.clear_capture_combos()
+            return
+
+        color_format = None
+        for candidate in supported_formats(device):
+            if candidate.pixelformat == config.pixel_format:
+                color_format = candidate
+                break
+
+        dialog.formatComboBox.blockSignals(True)
+        dialog.sizeComboBox.blockSignals(True)
+        dialog.intervalComboBox.blockSignals(True)
+        try:
+            dialog.formatComboBox.clear()
+            dialog.sizeComboBox.clear()
+            dialog.intervalComboBox.clear()
+
+            if color_format is None:
+                dialog.formatComboBox.addItem(
+                    fourcc_to_str(config.pixel_format),
+                    config.pixel_format,
+                )
+            else:
+                dialog.formatComboBox.addItem(format_label(color_format), config.pixel_format)
+            dialog.formatComboBox.setCurrentIndex(0)
+
+            dialog.sizeComboBox.addItem(
+                frame_size_label(FrameSize(config.frame_width, config.frame_height)),
+                (config.frame_width, config.frame_height),
+            )
+            dialog.sizeComboBox.setCurrentIndex(0)
+
+            interval = FrameInterval(config.interval_numerator, config.interval_denominator)
+            dialog.intervalComboBox.addItem(
+                frame_interval_label(interval),
+                (config.interval_numerator, config.interval_denominator),
+            )
+            dialog.intervalComboBox.setCurrentIndex(0)
+        finally:
+            dialog.formatComboBox.blockSignals(False)
+            dialog.sizeComboBox.blockSignals(False)
+            dialog.intervalComboBox.blockSignals(False)
 
     def selected_color_format(self, device: Device) -> ColorFormat | None:
         dialog = self.settings_dialog
