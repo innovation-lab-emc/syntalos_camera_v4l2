@@ -62,6 +62,10 @@ from pyrav4l2.v4l2 import (
 )
 import syntalos_mlink as syl
 
+import logging
+
+
+L = logging.getLogger("camera-v4l2")
 
 FRAME_QUEUE_MAX = 16
 DECODE_WARNING_INTERVAL = 30
@@ -340,7 +344,7 @@ def list_video_devices() -> list[VideoDeviceInfo]:
         try:
             dev = Device(path)
         except Exception as exc:
-            print(f"Skipping {path}: {exc.__class__.__name__}({exc})")
+            L.warning(f"Skipping {path}: {exc.__class__.__name__}({exc})")
             continue
         if not dev.is_video_capture_capable:
             continue
@@ -566,7 +570,7 @@ def read_camera_control_values(device: Device) -> dict[str, JsonControlValue]:
                 device.get_control_value(control),
             )
         except Exception as exc:
-            print(
+            L.error(
                 f"Unable to read control {control.name} "
                 + f"(0x{control.id:08x}): {exc.__class__.__name__}({exc})"
             )
@@ -616,21 +620,23 @@ def apply_saved_controls(device: Device, control_values: dict[str, JsonControlVa
         try:
             device.set_control_value(control, value_for_control_set(control, update.value))
         except Exception as exc:
-            print(f"Unable to set control {update.control_id}: {exc.__class__.__name__}({exc})")
+            L.error(f"Unable to set control {update.control_id}: {exc.__class__.__name__}({exc})")
 
 
 def drain_control_queue(device: Device, control_queue: ControlUpdateBuffer) -> None:
     updates = control_queue.drain()
     updates.sort(
-        key=lambda update: control_apply_priority(control)
-        if (control := find_control(device, update.control_id)) is not None
-        else (10, update.control_id)
+        key=lambda update: (
+            control_apply_priority(control)
+            if (control := find_control(device, update.control_id)) is not None
+            else (10, update.control_id)
+        )
     )
     for update in updates:
         try:
             apply_control_update(device, update)
         except Exception as exc:
-            print(f"Live control update failed: {exc.__class__.__name__}({exc})")
+            L.error(f"Live control update failed: {exc.__class__.__name__}({exc})")
 
 
 def queue_put_drop_oldest(
@@ -755,9 +761,9 @@ def capture_loop(
                         v4l2_sequence_warning_count == 1
                         or v4l2_sequence_warning_count % DROP_WARNING_INTERVAL == 0
                     ):
-                        print(
+                        L.warning(
                             "V4L2 buffer sequence moved unexpectedly: "
-                            f"previous={last_sequence}, current={metadata.sequence}"
+                            + f"previous={last_sequence}, current={metadata.sequence}"
                         )
                 elif sequence_gap > 0:
                     v4l2_sequence_warning_count += 1
@@ -765,10 +771,10 @@ def capture_loop(
                         v4l2_sequence_warning_count == 1
                         or v4l2_sequence_warning_count % DROP_WARNING_INTERVAL == 0
                     ):
-                        print(
+                        L.warning(
                             "V4L2 buffer sequence gap detected: "
-                            f"missed {sequence_gap} buffer(s); "
-                            f"previous={last_sequence}, current={metadata.sequence}"
+                            + f"missed {sequence_gap} buffer(s); "
+                            + f"previous={last_sequence}, current={metadata.sequence}"
                         )
             last_sequence = metadata.sequence
 
@@ -778,23 +784,23 @@ def capture_loop(
                 and timestamp_kind not in warned_timestamp_kinds
             ):
                 warned_timestamp_kinds.add(timestamp_kind)
-                print(
+                L.warning(
                     "V4L2 buffer timestamp is not CLOCK_MONOTONIC; "
-                    "submitting the raw driver timestamp. "
-                    f"type={v4l2_timestamp_type_name(metadata.timestamp_type)}, "
-                    f"source={v4l2_timestamp_source_name(metadata.timestamp_source)}, "
-                    f"flags=0x{metadata.flags:08x}"
+                    + "submitting the raw driver timestamp. "
+                    + f"type={v4l2_timestamp_type_name(metadata.timestamp_type)}, "
+                    + f"source={v4l2_timestamp_source_name(metadata.timestamp_source)}, "
+                    + f"flags=0x{metadata.flags:08x}"
                 )
 
             if metadata.has_error:
                 v4l2_error_count += 1
                 if v4l2_error_count == 1 or v4l2_error_count % DROP_WARNING_INTERVAL == 0:
-                    print(
+                    L.warning(
                         "Dropping V4L2 buffer flagged with ERROR: "
-                        f"sequence={metadata.sequence}, "
-                        f"timestamp_us={metadata.timestamp_us}, "
-                        f"bytesused={metadata.bytesused}, "
-                        f"flags=0x{metadata.flags:08x}"
+                        + f"sequence={metadata.sequence}, "
+                        + f"timestamp_us={metadata.timestamp_us}, "
+                        + f"bytesused={metadata.bytesused}, "
+                        + f"flags=0x{metadata.flags:08x}"
                     )
                 continue
 
@@ -810,15 +816,14 @@ def capture_loop(
             except FrameDecodeError as exc:
                 decode_failures += 1
                 if decode_failures == 1 or decode_failures % DECODE_WARNING_INTERVAL == 0:
-                    print(f"Skipping undecodable frame {frame_index}: {exc}")
+                    L.warning(f"Skipping undecodable frame {frame_index}: {exc}")
                 continue
 
             if queue_put_drop_oldest(frame_queue, CapturedFrame(frame_index, frame_time_us, mat)):
                 queue_drop_count += 1
                 if queue_drop_count == 1 or queue_drop_count % DROP_WARNING_INTERVAL == 0:
-                    print(
-                        "Capture queue full; "
-                        f"dropped {queue_drop_count} frame(s) before submission"
+                    L.warning(
+                        f"Capture queue full; dropped {queue_drop_count} frame(s) before submission"
                     )
 
             if stop_event.is_set():
@@ -1029,7 +1034,7 @@ class Module:
             interval = device.get_frame_interval()
             control_values = read_camera_control_values(device)
         except Exception as exc:
-            print(
+            L.error(
                 f"Unable to read camera settings from {device_path}: "
                 + f"{exc.__class__.__name__}({exc})"
             )
@@ -1056,7 +1061,7 @@ class Module:
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
             if thread.is_alive():
-                print("Camera capture thread did not stop within timeout")
+                L.error("Camera capture thread did not stop within timeout")
 
         self.capture_thread = None
         self.capture_stop_event = None
@@ -1075,16 +1080,15 @@ class Module:
                 self.frame_gap_warning_count == 1
                 or self.frame_gap_warning_count % DROP_WARNING_INTERVAL == 0
             ):
-                print(
+                L.warning(
                     "Camera frame index gap detected: "
-                    f"missed {missed} frame(s); "
-                    f"{self.dropped_frame_count} total frame(s) missed"
+                    + f"missed {missed} frame(s); "
+                    + f"{self.dropped_frame_count} total frame(s) missed"
                 )
             self.set_status(f"Recording; {self.dropped_frame_count} frame(s) missed.")
         elif frame_index < expected_index:
-            print(
-                f"Ignoring out-of-order camera frame index {frame_index}, "
-                f"expected {expected_index}"
+            L.warning(
+                f"Ignoring out-of-order camera frame index {frame_index}, expected {expected_index}"
             )
             return False
 
