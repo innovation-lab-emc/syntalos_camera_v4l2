@@ -35,10 +35,15 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from pyrav4l2 import Device, FrameInterval, FrameSize, Stream
+from pyrav4l2 import Device, FrameInterval, FrameSize, Stream, StreamFrameMetadata
 from pyrav4l2.controls import Control, IntegerMenuItem, Item, Menu, MenuItem
 from pyrav4l2.device import ColorFormat
 from pyrav4l2.v4l2 import (
+    V4L2_BUF_FLAG_TIMESTAMP_COPY,
+    V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC,
+    V4L2_BUF_FLAG_TIMESTAMP_UNKNOWN,
+    V4L2_BUF_FLAG_TSTAMP_SRC_EOF,
+    V4L2_BUF_FLAG_TSTAMP_SRC_SOE,
     V4L2_CTRL_TYPE_BITMASK,
     V4L2_CTRL_TYPE_BOOLEAN,
     V4L2_CTRL_TYPE_BUTTON,
@@ -63,6 +68,7 @@ DECODE_WARNING_INTERVAL = 30
 DROP_WARNING_INTERVAL = 30
 SPINBOX_MIN = -(2**31)
 SPINBOX_MAX = 2**31 - 1
+V4L2_SEQUENCE_MODULUS = 2**32
 
 V4L2_CID_BASE = 0x00980900
 V4L2_CID_AUTO_WHITE_BALANCE = V4L2_CID_BASE + 12
@@ -149,7 +155,7 @@ class CaptureConfig:
     interval_numerator: int
     interval_denominator: int
     control_values: dict[str, JsonControlValue]
-    start_perf_ns: int = 0
+    start_monotonic_ns: int = 0
     start_syl_us: int = 0
 
 
@@ -189,6 +195,55 @@ class CaptureError:
 
 class FrameDecodeError(ValueError):
     pass
+
+
+def monotonic_clock_ns() -> int:
+    return time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+
+
+def syntalos_clock_anchor() -> tuple[int, int]:
+    monotonic_before_ns = monotonic_clock_ns()
+    start_syl_us = int(syl.time_since_start_usec())
+    monotonic_after_ns = monotonic_clock_ns()
+    return (monotonic_before_ns + monotonic_after_ns) // 2, start_syl_us
+
+
+def v4l2_timestamp_type_name(timestamp_type: int) -> str:
+    if timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_UNKNOWN:
+        return "unknown"
+    if timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC:
+        return "monotonic"
+    if timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_COPY:
+        return "copy"
+    return f"0x{timestamp_type:08x}"
+
+
+def v4l2_timestamp_source_name(timestamp_source: int) -> str:
+    if timestamp_source == V4L2_BUF_FLAG_TSTAMP_SRC_EOF:
+        return "end-of-frame"
+    if timestamp_source == V4L2_BUF_FLAG_TSTAMP_SRC_SOE:
+        return "start-of-exposure"
+    return f"0x{timestamp_source:08x}"
+
+
+def v4l2_sequence_gap(previous_sequence: int, current_sequence: int) -> int | None:
+    delta = (current_sequence - previous_sequence) % V4L2_SEQUENCE_MODULUS
+    if delta == 1:
+        return 0
+    if 1 < delta < (V4L2_SEQUENCE_MODULUS // 2):
+        return delta - 1
+    return None
+
+
+def v4l2_timestamp_to_syntalos_us(metadata: StreamFrameMetadata, config: CaptureConfig) -> int:
+    if metadata.timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC:
+        # V4L2 reports CLOCK_MONOTONIC time; Syntalos Frame.time is time since run start.
+        return max(
+            0,
+            config.start_syl_us + (metadata.timestamp_us - config.start_monotonic_ns // 1_000),
+        )
+
+    return metadata.timestamp_us
 
 
 def serialise_settings(settings: Settings) -> bytes:
@@ -680,20 +735,74 @@ def capture_loop(
 
         apply_saved_controls(device, config.control_values)
 
-        frame_index = 0
+        last_sequence: int | None = None
         decode_failures = 0
+        v4l2_error_count = 0
+        v4l2_sequence_warning_count = 0
+        warned_timestamp_kinds: set[tuple[int, int]] = set()
         queue_drop_count = 0
-        for frame_bytes in Stream(device):
+        for stream_frame in Stream(device).iter_frames():
             drain_control_queue(device, control_queue)
             if stop_event.is_set():
                 break
 
-            frame_time_us = config.start_syl_us + max(
-                0, (time.perf_counter_ns() - config.start_perf_ns) // 1_000
-            )
+            metadata = stream_frame.metadata
+            if last_sequence is not None:
+                sequence_gap = v4l2_sequence_gap(last_sequence, metadata.sequence)
+                if sequence_gap is None:
+                    v4l2_sequence_warning_count += 1
+                    if (
+                        v4l2_sequence_warning_count == 1
+                        or v4l2_sequence_warning_count % DROP_WARNING_INTERVAL == 0
+                    ):
+                        print(
+                            "V4L2 buffer sequence moved unexpectedly: "
+                            f"previous={last_sequence}, current={metadata.sequence}"
+                        )
+                elif sequence_gap > 0:
+                    v4l2_sequence_warning_count += 1
+                    if (
+                        v4l2_sequence_warning_count == 1
+                        or v4l2_sequence_warning_count % DROP_WARNING_INTERVAL == 0
+                    ):
+                        print(
+                            "V4L2 buffer sequence gap detected: "
+                            f"missed {sequence_gap} buffer(s); "
+                            f"previous={last_sequence}, current={metadata.sequence}"
+                        )
+            last_sequence = metadata.sequence
+
+            timestamp_kind = (metadata.timestamp_type, metadata.timestamp_source)
+            if (
+                metadata.timestamp_type != V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
+                and timestamp_kind not in warned_timestamp_kinds
+            ):
+                warned_timestamp_kinds.add(timestamp_kind)
+                print(
+                    "V4L2 buffer timestamp is not CLOCK_MONOTONIC; "
+                    "submitting the raw driver timestamp. "
+                    f"type={v4l2_timestamp_type_name(metadata.timestamp_type)}, "
+                    f"source={v4l2_timestamp_source_name(metadata.timestamp_source)}, "
+                    f"flags=0x{metadata.flags:08x}"
+                )
+
+            if metadata.has_error:
+                v4l2_error_count += 1
+                if v4l2_error_count == 1 or v4l2_error_count % DROP_WARNING_INTERVAL == 0:
+                    print(
+                        "Dropping V4L2 buffer flagged with ERROR: "
+                        f"sequence={metadata.sequence}, "
+                        f"timestamp_us={metadata.timestamp_us}, "
+                        f"bytesused={metadata.bytesused}, "
+                        f"flags=0x{metadata.flags:08x}"
+                    )
+                continue
+
+            frame_index = int(metadata.sequence)
+            frame_time_us = v4l2_timestamp_to_syntalos_us(metadata, config)
             try:
                 mat = decode_frame(
-                    frame_bytes,
+                    stream_frame.data,
                     config.pixel_format,
                     config.frame_width,
                     config.frame_height,
@@ -702,7 +811,6 @@ def capture_loop(
                 decode_failures += 1
                 if decode_failures == 1 or decode_failures % DECODE_WARNING_INTERVAL == 0:
                     print(f"Skipping undecodable frame {frame_index}: {exc}")
-                frame_index += 1
                 continue
 
             if queue_put_drop_oldest(frame_queue, CapturedFrame(frame_index, frame_time_us, mat)):
@@ -712,7 +820,6 @@ def capture_loop(
                         "Capture queue full; "
                         f"dropped {queue_drop_count} frame(s) before submission"
                     )
-            frame_index += 1
 
             if stop_event.is_set():
                 break
@@ -800,7 +907,7 @@ class Module:
         self.capture_stop_event: threading.Event | None = None
         self.frame_queue: queue.Queue[CapturedFrame | CaptureError] | None = None
         self.control_queue: ControlUpdateBuffer | None = None
-        self.next_expected_frame_index = 0
+        self.next_expected_frame_index: int | None = None
         self.dropped_frame_count = 0
         self.frame_gap_warning_count = 0
 
@@ -840,6 +947,8 @@ class Module:
 
         self.out_frames.set_metadata_value_size("size", [config.frame_width, config.frame_height])
         self.out_frames.set_metadata_value("pixel_format", fourcc_to_str(config.pixel_format))
+        self.out_frames.set_metadata_value("time_source", "v4l2_buffer_timestamp")
+        self.out_frames.set_metadata_value("index_source", "v4l2_buffer_sequence")
         fps = frame_interval_fps(
             FrameInterval(config.interval_numerator, config.interval_denominator)
         )
@@ -860,14 +969,15 @@ class Module:
         assert self.control_queue is not None
         assert self.capture_stop_event is not None
 
+        start_monotonic_ns, start_syl_us = syntalos_clock_anchor()
         config = replace(
             self.capture_config,
-            start_perf_ns=time.perf_counter_ns(),
-            start_syl_us=int(syl.time_since_start_usec()),
+            start_monotonic_ns=start_monotonic_ns,
+            start_syl_us=start_syl_us,
         )
         self.capture_config = config
         self.running = True
-        self.next_expected_frame_index = 0
+        self.next_expected_frame_index = None
         self.dropped_frame_count = 0
         self.frame_gap_warning_count = 0
         self.update_capture_widget_state()
@@ -953,6 +1063,10 @@ class Module:
 
     def note_submitted_frame_index(self, frame_index: int) -> bool:
         expected_index = self.next_expected_frame_index
+        if expected_index is None:
+            self.next_expected_frame_index = frame_index + 1
+            return True
+
         if frame_index > expected_index:
             missed = frame_index - expected_index
             self.dropped_frame_count += missed
