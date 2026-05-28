@@ -1,6 +1,6 @@
 numpy
 opencv-python-headless
 PyQt6
-# git+https://github.com/antmicro/pyrav4l2.git
+# git+https://github.com/antmicro/pyrav4l2.git@dev
 -e file:///home/ilab/Repos/pyrav4l2
 setproctitle # required for rename_process=True
