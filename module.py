@@ -1036,6 +1036,7 @@ class Module:
     def load_settings(self, settings: bytes, _base_dir: Path) -> bool:
         try:
             self.settings = deserialise_settings(settings)
+            print(f"⬅️ Settings loaded {self.settings}")
             return True
         except Exception:
             self.settings = Settings()
@@ -1043,6 +1044,7 @@ class Module:
 
     def save_settings(self, _base_dir: Path) -> bytes:
         self.update_settings_from_camera()
+        print(f"➡️ Settings saved {self.settings}")
         return serialise_settings(self.settings)
 
     def update_settings_from_camera(self) -> None:
