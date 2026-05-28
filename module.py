@@ -248,7 +248,8 @@ def v4l2_sequence_gap(previous_sequence: int, current_sequence: int) -> int | No
 
 
 def v4l2_timestamp_to_syntalos_us(metadata: StreamFrameMetadata, config: CaptureConfig) -> int:
-    assert metadata.timestamp_type == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, "Not monotonic"
+    if metadata.timestamp_type != V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC:
+        raise TypeError(f"{metadata.timestamp_type=} != {V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC = }")
     # V4L2 reports CLOCK_MONOTONIC time; Syntalos Frame.time is time since run start.
     return max(
         0,
