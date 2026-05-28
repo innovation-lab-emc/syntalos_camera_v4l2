@@ -73,6 +73,7 @@ DROP_WARNING_INTERVAL = 30
 SPINBOX_MIN = -(2**31)
 SPINBOX_MAX = 2**31 - 1
 V4L2_SEQUENCE_MODULUS = 2**32
+V4L2_STREAM_SELECT_TIMEOUT_SEC = 0.25
 
 V4L2_CID_BASE = 0x00980900
 V4L2_CID_AUTO_WHITE_BALANCE = V4L2_CID_BASE + 12
@@ -761,7 +762,10 @@ def capture_loop(
         v4l2_sequence_warning_count = 0
         warned_timestamp_kinds: set[tuple[int, int]] = set()
         queue_drop_count = 0
-        for stream_frame in Stream(device).iter_frames():
+        for stream_frame in Stream(device).iter_frames(
+            stop_requested=stop_event.is_set,
+            select_timeout=V4L2_STREAM_SELECT_TIMEOUT_SEC,
+        ):
             drain_control_queue(device, control_queue)
             if stop_event.is_set():
                 break
