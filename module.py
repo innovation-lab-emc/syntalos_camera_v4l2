@@ -1088,12 +1088,14 @@ class Module:
 
     def note_submitted_frame_index(self, frame_index: int) -> bool:
         expected_index = self.next_expected_frame_index
+        current_index = frame_index % V4L2_SEQUENCE_MODULUS
         if expected_index is None:
-            self.next_expected_frame_index = frame_index + 1
+            self.next_expected_frame_index = (current_index + 1) % V4L2_SEQUENCE_MODULUS
             return True
 
-        if frame_index > expected_index:
-            missed = frame_index - expected_index
+        delta = (current_index - expected_index) % V4L2_SEQUENCE_MODULUS
+        if 0 < delta < (V4L2_SEQUENCE_MODULUS // 2):
+            missed = delta
             self.dropped_frame_count += missed
             self.frame_gap_warning_count += 1
             if (
@@ -1106,13 +1108,13 @@ class Module:
                     + f"{self.dropped_frame_count} total frame(s) missed"
                 )
             self.set_status(f"Recording; {self.dropped_frame_count} frame(s) missed.")
-        elif frame_index < expected_index:
+        elif delta >= (V4L2_SEQUENCE_MODULUS // 2):
             L.warning(
                 f"Ignoring out-of-order camera frame index {frame_index}, expected {expected_index}"
             )
             return False
 
-        self.next_expected_frame_index = frame_index + 1
+        self.next_expected_frame_index = (current_index + 1) % V4L2_SEQUENCE_MODULUS
         return True
 
     def process_capture_queue(self) -> None:
@@ -1881,9 +1883,7 @@ class Module:
                 )
             )
 
-            def set_combo_value(
-                new_value: JsonControlValue, widget: QComboBox = combo
-            ) -> None:
+            def set_combo_value(new_value: JsonControlValue, widget: QComboBox = combo) -> None:
                 self.set_combo_current_data(widget, int(new_value))
 
             return self.register_control_widget(control, combo, int(value), set_combo_value)
@@ -1991,9 +1991,7 @@ class Module:
                 )
             )
 
-            def set_spinbox_value(
-                new_value: JsonControlValue, widget: QSpinBox = spinbox
-            ) -> None:
+            def set_spinbox_value(new_value: JsonControlValue, widget: QSpinBox = spinbox) -> None:
                 previous_blocked = widget.blockSignals(True)
                 widget.setValue(snap_control_value(control, int(new_value)))
                 widget.blockSignals(previous_blocked)
