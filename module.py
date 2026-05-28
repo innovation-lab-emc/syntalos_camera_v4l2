@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, final
+from typing import Any, Callable, final
 
 import cv2 as cv
 import numpy as np
@@ -84,6 +84,13 @@ V4L2_CID_EXPOSURE_ABSOLUTE = V4L2_CID_CAMERA_CLASS_BASE + 2
 V4L2_CID_EXPOSURE_AUTO_PRIORITY = V4L2_CID_CAMERA_CLASS_BASE + 3
 V4L2_CID_FOCUS_ABSOLUTE = V4L2_CID_CAMERA_CLASS_BASE + 10
 V4L2_CID_FOCUS_AUTO = V4L2_CID_CAMERA_CLASS_BASE + 12
+V4L2_EXPOSURE_MANUAL = 1
+
+AUTO_CONTROL_DEPENDENT_IDS = {
+    V4L2_CID_AUTO_WHITE_BALANCE: V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+    V4L2_CID_EXPOSURE_AUTO: V4L2_CID_EXPOSURE_ABSOLUTE,
+    V4L2_CID_FOCUS_AUTO: V4L2_CID_FOCUS_ABSOLUTE,
+}
 
 AUTO_CONTROL_IDS = {
     V4L2_CID_AUTO_WHITE_BALANCE,
@@ -111,6 +118,7 @@ CONTROL_NAME_PRIORITIES = {
 }
 
 JsonControlValue = bool | int | str
+ControlValueSetter = Callable[[JsonControlValue], None]
 
 SUPPORTED_PIXEL_FORMATS = {
     V4L2_PIX_FMT_MJPEG,
@@ -503,6 +511,13 @@ def control_value_to_json(control: Control, value: Any) -> JsonControlValue:
     if control.type == V4L2_CTRL_TYPE_STRING:
         return str(value)
     raise ValueError(f"Unsupported control type {control.type} for {control.name}")
+
+
+def auto_control_is_enabled(control_id: int, value: JsonControlValue) -> bool:
+    if control_id == V4L2_CID_EXPOSURE_AUTO:
+        with contextlib.suppress(TypeError, ValueError):
+            return int(value) != V4L2_EXPOSURE_MANUAL
+    return bool(value)
 
 
 def normalized_control_name(control: Control) -> str:
@@ -917,6 +932,10 @@ class Module:
         self.settings_dialog: QDialog | None = None
         self.populating_controls = False
         self.capture_widgets_enabled: bool | None = None
+        self.control_widgets: dict[int, QWidget] = {}
+        self.control_widget_base_enabled: dict[int, bool] = {}
+        self.control_value_setters: dict[int, ControlValueSetter] = {}
+        self.control_display_values: dict[int, JsonControlValue] = {}
 
         self.register_ports()
         self.register_callbacks()
@@ -1218,6 +1237,7 @@ class Module:
     def cleanup_settings_dialog(self, _result: int) -> None:
         dialog = self.settings_dialog
         self.settings_dialog = None
+        self.clear_control_widget_state()
         if dialog is not None:
             dialog.deleteLater()
 
@@ -1309,10 +1329,132 @@ class Module:
             combo.blockSignals(False)
 
     def clear_controls(self) -> None:
+        self.clear_control_widget_state()
         dialog = self.settings_dialog
         if dialog is None:
             return
         clear_layout(dialog.controlFormLayout)
+
+    def clear_control_widget_state(self) -> None:
+        self.control_widgets.clear()
+        self.control_widget_base_enabled.clear()
+        self.control_value_setters.clear()
+        self.control_display_values.clear()
+
+    def register_control_widget(
+        self,
+        control: Control,
+        widget: QWidget,
+        value: JsonControlValue,
+        set_value: ControlValueSetter | None = None,
+    ) -> QWidget:
+        self.control_widgets[control.id] = widget
+        self.control_widget_base_enabled[control.id] = not control.is_read_only
+        self.control_display_values[control.id] = value
+        if set_value is not None:
+            self.control_value_setters[control.id] = set_value
+        return widget
+
+    def update_control_widget_value(
+        self, control_id: int, value: JsonControlValue, persist: bool = True
+    ) -> None:
+        self.control_display_values[control_id] = value
+        if persist:
+            self.settings.control_values[str(control_id)] = value
+
+        setter = self.control_value_setters.get(control_id)
+        if setter is None:
+            return
+
+        try:
+            setter(value)
+        except Exception as exc:
+            L.error(
+                f"Unable to update control widget {control_id}: "
+                + f"{exc.__class__.__name__}({exc})"
+            )
+
+    def update_auto_dependent_control_widgets(self) -> None:
+        for auto_control_id, dependent_control_id in AUTO_CONTROL_DEPENDENT_IDS.items():
+            dependent_widget = self.control_widgets.get(dependent_control_id)
+            if dependent_widget is None:
+                continue
+
+            auto_value = self.control_display_values.get(auto_control_id)
+            if auto_value is None:
+                auto_value = self.settings.control_values.get(str(auto_control_id))
+            if auto_value is None:
+                continue
+
+            dependent_widget.setEnabled(
+                self.control_widget_base_enabled.get(dependent_control_id, True)
+                and not auto_control_is_enabled(auto_control_id, auto_value)
+            )
+
+    def open_selected_control_device(self) -> Device | None:
+        device_path = self.selected_device_path()
+        if not device_path:
+            return None
+        try:
+            return Device(device_path)
+        except Exception as exc:
+            self.set_status(f"Unable to open {device_path}: {exc}")
+            return None
+
+    def apply_control_to_device(
+        self, device: Device, control_id: int, value: JsonControlValue
+    ) -> bool:
+        control = find_control(device, control_id)
+        if control is None or control.is_disabled or control.is_read_only:
+            return False
+
+        try:
+            device.set_control_value(control, value_for_control_set(control, value))
+        except Exception as exc:
+            L.error(
+                f"Unable to set control {control.name} "
+                + f"(0x{control.id:08x}): {exc.__class__.__name__}({exc})"
+            )
+            return False
+        return True
+
+    def update_dependent_control_from_device(
+        self, device: Device, dependent_control_id: int
+    ) -> None:
+        control = find_control(device, dependent_control_id)
+        if control is None:
+            return
+
+        with contextlib.suppress(Exception):
+            control = device.update_control(control)
+
+        try:
+            value = control_value_to_json(control, device.get_control_value(control))
+        except Exception as exc:
+            L.error(
+                f"Unable to read control {control.name} "
+                + f"(0x{control.id:08x}): {exc.__class__.__name__}({exc})"
+            )
+            self.set_status(f"Unable to read {humanize_control_name(control.name)}: {exc}")
+            return
+
+        self.update_control_widget_value(dependent_control_id, value)
+
+    def handle_auto_control_changed(self, control_id: int, value: JsonControlValue) -> None:
+        dependent_control_id = AUTO_CONTROL_DEPENDENT_IDS.get(control_id)
+        if dependent_control_id is None:
+            return
+
+        device = self.open_selected_control_device()
+        if device is not None:
+            self.apply_control_to_device(device, control_id, value)
+
+        self.update_auto_dependent_control_widgets()
+        if auto_control_is_enabled(control_id, value) or device is None:
+            return
+
+        self.update_dependent_control_from_device(device, dependent_control_id)
+        self.update_auto_dependent_control_widgets()
 
     def on_device_changed(self, _index: int | None = None) -> None:
         device_path = self.selected_device_path()
@@ -1689,6 +1831,7 @@ class Module:
 
         self.populating_controls = True
         try:
+            self.clear_control_widget_state()
             clear_layout(dialog.controlFormLayout)
 
             for control in device.controls:
@@ -1712,6 +1855,7 @@ class Module:
                 dialog.controlFormLayout.addRow(label, widget)
         finally:
             self.populating_controls = False
+        self.update_auto_dependent_control_widgets()
 
     def widget_for_control(self, device: Device, control: Control) -> QWidget | None:
         saved = self.settings.control_values.get(str(control.id), None)
@@ -1735,7 +1879,13 @@ class Module:
                     ctrl_id, int(widget.currentData())
                 )
             )
-            return combo
+
+            def set_combo_value(
+                new_value: JsonControlValue, widget: QComboBox = combo
+            ) -> None:
+                self.set_combo_current_data(widget, int(new_value))
+
+            return self.register_control_widget(control, combo, int(value), set_combo_value)
 
         if control.type == V4L2_CTRL_TYPE_BOOLEAN:
             checkbox = QCheckBox()
@@ -1745,7 +1895,20 @@ class Module:
                     ctrl_id, state == Qt.CheckState.Checked.value
                 )
             )
-            return checkbox
+
+            def set_checkbox_value(
+                new_value: JsonControlValue, widget: QCheckBox = checkbox
+            ) -> None:
+                previous_blocked = widget.blockSignals(True)
+                widget.setChecked(bool(new_value))
+                widget.blockSignals(previous_blocked)
+
+            return self.register_control_widget(
+                control,
+                checkbox,
+                bool(value),
+                set_checkbox_value,
+            )
 
         if control.type == V4L2_CTRL_TYPE_BUTTON:
             button = QPushButton("Trigger")
@@ -1768,7 +1931,20 @@ class Module:
                         ctrl_id, int(widget.text())
                     )
                 )
-                return line_edit
+
+                def set_integer_text_value(
+                    new_value: JsonControlValue, widget: QLineEdit = line_edit
+                ) -> None:
+                    previous_blocked = widget.blockSignals(True)
+                    widget.setText(str(int(new_value)))
+                    widget.blockSignals(previous_blocked)
+
+                return self.register_control_widget(
+                    control,
+                    line_edit,
+                    int(value),
+                    set_integer_text_value,
+                )
 
             return self.integer_control_widget(control, int(value))
 
@@ -1779,7 +1955,20 @@ class Module:
                     ctrl_id, widget.text()
                 )
             )
-            return line_edit
+
+            def set_string_value(
+                new_value: JsonControlValue, widget: QLineEdit = line_edit
+            ) -> None:
+                previous_blocked = widget.blockSignals(True)
+                widget.setText(str(new_value))
+                widget.blockSignals(previous_blocked)
+
+            return self.register_control_widget(
+                control,
+                line_edit,
+                str(value),
+                set_string_value,
+            )
 
         return None
 
@@ -1800,7 +1989,20 @@ class Module:
                     snap_control_value(control, int(new_value)),
                 )
             )
-            return spinbox
+
+            def set_spinbox_value(
+                new_value: JsonControlValue, widget: QSpinBox = spinbox
+            ) -> None:
+                previous_blocked = widget.blockSignals(True)
+                widget.setValue(snap_control_value(control, int(new_value)))
+                widget.blockSignals(previous_blocked)
+
+            return self.register_control_widget(
+                control,
+                spinbox,
+                initial_value,
+                set_spinbox_value,
+            )
 
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -1846,9 +2048,17 @@ class Module:
                 return
             submit_value(new_value)
 
+        def set_integer_value(new_value: JsonControlValue) -> None:
+            set_widgets(snap_control_value(control, int(new_value)))
+
         slider.valueChanged.connect(slider_changed)
         spinbox.valueChanged.connect(spinbox_changed)
-        return container
+        return self.register_control_widget(
+            control,
+            container,
+            initial_value,
+            set_integer_value,
+        )
 
     def on_control_changed(
         self, control_id: int, value: JsonControlValue, persist: bool = True
@@ -1858,6 +2068,8 @@ class Module:
 
         if persist:
             self.settings.control_values[str(control_id)] = value
+        self.control_display_values[control_id] = value
+        self.handle_auto_control_changed(control_id, value)
         self.queue_control_update(control_id, value)
 
 
