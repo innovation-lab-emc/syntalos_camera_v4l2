@@ -1,4 +1,4 @@
-# Syntalos UVC Camera Module
+# EXPERIMENTAL! Syntalos UVC Camera Module
 
 Python Syntalos module for streaming frames from UVC/V4L2 cameras with
 `pyrav4l2`.
